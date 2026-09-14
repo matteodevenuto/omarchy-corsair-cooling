@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "matteodevenuto.corsair-cooling",
+  "name": "Corsair Cooling",
+  "version": "1.0.0",
+  "author": "Matteo De Venuto",
+  "license": "MIT",
+  "description": "Monitor and safely apply fixed cooling presets to a Corsair Commander CORE from the Omarchy bar.",
+  "homepage": "https://github.com/matteodevenuto/omarchy-corsair-cooling",
+  "repository": "https://github.com/matteodevenuto/omarchy-corsair-cooling",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Corsair Cooling",
+    "description": "Coolant, pump and fan telemetry with guarded Quiet, Balanced, Performance and Full Speed presets",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ -x /usr/bin/liquidctl ]]; then
+  LIQUIDCTL=/usr/bin/liquidctl
+else
+  LIQUIDCTL="${HOME}/.local/bin/liquidctl"
+fi
+DEVICE="Commander Core"
+RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/tmp}"
+LOCK_FILE="${RUNTIME_ROOT}/matteodevenuto-corsair-cooling.lock"
+
+if [[ ! -x "$LIQUIDCTL" ]]; then
+  printf '{"ok":false,"error":"liquidctl is not installed at %s"}\n' "$LIQUIDCTL"
+  exit 1
+fi
+
+# Omarchy renders one bar instance per monitor.  Commander CORE speaks a
+# stateful USB protocol and rejects overlapping requests, so serialize every
+# read and write from all widget instances.
+exec 9>"$LOCK_FILE"
+if ! /usr/bin/flock -w 8 9; then
+  printf '{"ok":false,"error":"Commander CORE is busy"}\n'
+  exit 3
+fi
+
+action="${1:-status}"
+
+case "$action" in
+  status)
+    exec "$LIQUIDCTL" --match "$DEVICE" --json status
+    ;;
+  initialize)
+    "$LIQUIDCTL" --match "$DEVICE" initialize >/dev/null
+    printf '{"ok":true,"profile":"Initialized"}\n'
+    ;;
+  preset)
+    preset="${2:-}"
+    case "$preset" in
+      quiet)
+        pump=75
+        curve=(28 30 32 35 35 45 38 60 41 75 43 90 45 100)
+        label="Quiet"
+        ;;
+      balanced)
+        pump=85
+        curve=(26 35 30 40 34 55 37 70 40 85 43 100)
+        label="Balanced"
+        ;;
+      performance)
+        pump=100
+        curve=(25 50 30 60 34 70 37 85 40 100)
+        label="Performance"
+        ;;
+      full)
+        "$LIQUIDCTL" --match "$DEVICE" set fans speed 100 >/dev/null
+        "$LIQUIDCTL" --match "$DEVICE" set pump speed 100 >/dev/null
+        printf '{"ok":true,"profile":"Full Speed"}\n'
+        exit 0
+        ;;
+      *)
+        printf '{"ok":false,"error":"unknown preset"}\n'
+        exit 2
+        ;;
+    esac
+
+    "$LIQUIDCTL" --match "$DEVICE" set fans speed "${curve[@]}" >/dev/null
+    "$LIQUIDCTL" --match "$DEVICE" set pump speed "$pump" >/dev/null
+    printf '{"ok":true,"profile":"%s"}\n' "$label"
+    ;;
+  *)
+    printf '{"ok":false,"error":"unknown action"}\n'
+    exit 2
+    ;;
+esac
