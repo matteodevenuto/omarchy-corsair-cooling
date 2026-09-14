@@ -2,6 +2,8 @@
 
 Omarchy bar widget for Corsair Commander CORE fan and AIO control.
 
+![Corsair Cooling panel showing live coolant, pump and fan telemetry](preview.png)
+
 - Live coolant, pump and six-fan telemetry through `liquidctl`
 - Quiet, Balanced, Performance and Full Speed profiles
 - Two-step confirmation before every control write
