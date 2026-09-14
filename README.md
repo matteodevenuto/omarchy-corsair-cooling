@@ -2,9 +2,9 @@
 
 Omarchy bar widget for Corsair Commander CORE fan and AIO control.
 
-![Corsair Cooling panel showing live coolant, pump and fan telemetry](preview.png)
+![Corsair Cooling panel showing coolant, pump and fan telemetry](preview.png)
 
-- Live coolant, pump and six-fan telemetry through `liquidctl`
+- On-demand coolant, pump and six-fan telemetry through `liquidctl`
 - Quiet, Balanced, Performance and Full Speed profiles
 - Two-step confirmation before every control write
 - No automatic profile application at startup
@@ -45,7 +45,8 @@ omarchy plugin add https://github.com/matteodevenuto/omarchy-corsair-cooling.git
 
 ## Safety
 
-- Telemetry polling is read-only.
+- Telemetry refresh is manual because every Commander CORE status request can
+  flash its RGB. Press `r` in the panel or middle-click the bar widget to read it.
 - No profile is applied automatically at startup.
 - Every profile write requires selecting a profile and confirming it.
 - USB requests are serialized because Omarchy creates one widget per monitor
@@ -56,6 +57,20 @@ omarchy plugin add https://github.com/matteodevenuto/omarchy-corsair-cooling.git
 The liquidctl driver currently labels Commander CORE support as
 `broken`/experimental. Watch coolant temperature and RPM during the first use
 of each profile.
+
+## Known limitation: RGB flashes during device access
+
+Commander CORE can briefly leave hardware-lighting mode whenever `liquidctl`
+reads status or writes a profile. This is an upstream device/driver limitation,
+not an RGB effect produced by this plugin. It is tracked in
+[`liquidctl` issue #448](https://github.com/liquidctl/liquidctl/issues/448), and
+the protocol documents that sleep returns the controller to hardware mode:
+[`commander_core.md`](https://github.com/liquidctl/liquidctl/blob/main/docs/developer/protocol/commander_core.md#wake-upsleep).
+
+To prevent repeated flashing, version 1.0.1 performs no automatic refreshes.
+Status is read only after pressing `r`, middle-clicking the widget, or invoking
+its refresh IPC method. A single flash can still occur for each explicit read
+or profile change.
 
 ## Profiles
 

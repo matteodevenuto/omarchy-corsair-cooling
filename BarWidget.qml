@@ -13,9 +13,6 @@ Panel {
 
   readonly property string helperPath:
     Qt.resolvedUrl("corsair-cooling").toString().replace(/^file:\/\//, "")
-  readonly property int refreshIntervalSec:
-    Math.max(2, Math.min(60, Number(setting("refreshIntervalSec", 5)) || 5))
-
   property bool connected: false
   property bool loading: false
   property bool applying: false
@@ -150,19 +147,10 @@ Panel {
         root.lastProfile = root.presetLabel(actionProc.requestedPreset)
         root.pendingPreset = ""
         root.errorText = ""
-        Qt.callLater(root.refresh)
       } else if (root.errorText === "") {
         root.errorText = "Could not apply " + root.presetLabel(actionProc.requestedPreset)
       }
     }
-  }
-
-  Timer {
-    interval: root.refreshIntervalSec * 1000
-    repeat: true
-    running: true
-    triggeredOnStart: true
-    onTriggered: root.refresh()
   }
 
   BarIconButton {
@@ -173,7 +161,7 @@ Panel {
     tooltipText: root.connected
       ? "Corsair cooling · " + (root.waterTemp > 0 ? root.waterTemp.toFixed(1) + "°C" : "temperature unavailable")
         + " · pump " + root.pumpRpm + " RPM"
-      : "Corsair cooling · disconnected"
+      : "Corsair cooling · press r or middle-click to refresh"
     foreground: root.opened ? Color.accent : root.temperatureColor
 
     onPressed: function(mouseButton) {
@@ -418,7 +406,7 @@ Panel {
           }
           Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: "r refreshes · Esc closes"
+            text: "r refreshes (RGB may flash once) · Esc closes"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
