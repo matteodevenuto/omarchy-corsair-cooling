@@ -1,51 +1,62 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
+// Commander CORE readout in the bar (styled like meviusisback.hw-monitor's
+// temperature cell) plus a tabbed panel: overview, fan curves and lighting.
 Panel {
   id: root
 
   moduleName: "matteodevenuto.corsair-cooling"
   ipcTarget: "matteodevenuto.corsair-cooling"
+  manageIpc: false
 
   readonly property string helperPath:
     Qt.resolvedUrl("corsair-cooling").toString().replace(/^file:\/\//, "")
+  readonly property bool vertical: bar ? bar.vertical : false
+
+  // Telemetry
   property bool connected: false
   property bool loading: false
   property bool applying: false
   property string errorText: ""
-  property string pendingPreset: ""
-  property string lastProfile: "Not changed this session"
   property real waterTemp: -1
   property int pumpRpm: -1
   property var fans: []
+  property var coolantHistory: []  // from corsair-rgbd (6 min), else one sample per manual read
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  // Cooling profile last applied through the panel
+  property string profileName: ""
+  property int profilePump: 0
+  property var profileCurve: []
+
+  // Lighting, mirrored from corsair-rgbd's config
+  property bool rgbdRunning: false
+  property var lighting: ({})
+
+  // Bar look (shared with hw-monitor)
+  readonly property int iconSize: Style.bar.iconFont
+  readonly property int valueSize: Math.max(9, Math.round(iconSize * 0.92))
+  readonly property int contentHeight: Math.max(Math.max(Style.bar.iconCanvas, iconSize + Style.space(2)), Style.space(15))
+  readonly property color base: bar ? bar.barForeground : Color.foreground
+  readonly property color hot: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(base, 1.45)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property int barSlot: Style.space(62)
 
-  function faded(color, amount) {
-    var bg = Color.background
-    return Qt.rgba(color.r + (bg.r - color.r) * amount,
-                   color.g + (bg.g - color.g) * amount,
-                   color.b + (bg.b - color.b) * amount, 1)
+  // Same as hw-monitor's warm(): blend toward urgent as coolant heats past 40 °C (full at 45 °C).
+  readonly property real heat: waterTemp > 40 ? Math.min(1, (waterTemp - 40) / 5) : 0
+  function warm(from) {
+    return Qt.rgba(from.r + (hot.r - from.r) * heat, from.g + (hot.g - from.g) * heat,
+                   from.b + (hot.b - from.b) * heat, from.a)
   }
 
-  readonly property color muted: faded(foreground, 0.55)
-  readonly property color temperatureColor: waterTemp >= 43 ? urgent
-    : waterTemp >= 40 ? "#e5a84b" : foreground
-
-  implicitWidth: bar && bar.vertical ? (bar ? bar.barSize : Style.bar.sizeHorizontal) : barSlot
-  implicitHeight: bar && bar.vertical ? barSlot : (bar ? bar.barSize : Style.bar.sizeHorizontal)
-
-  function refresh() {
+  function refresh(cached) {
     if (statusProc.running || applying) return
     loading = true
-    statusProc.command = [helperPath, "status"]
+    statusProc.cached = cached === true
+    statusProc.command = [helperPath, statusProc.cached ? "cached" : "status"]
     statusProc.running = true
   }
 
@@ -57,7 +68,6 @@ Panel {
       errorText = "Commander CORE status unavailable"
       return
     }
-
     var nextFans = []
     var temp = -1
     var pump = -1
@@ -76,48 +86,60 @@ Panel {
     waterTemp = temp
     pumpRpm = pump
     fans = nextFans
+    if (Array.isArray(payload[0].history)) coolantHistory = payload[0].history
+    else if (temp > 0) coolantHistory = coolantHistory.concat([temp]).slice(-120)
   }
 
-  function requestPreset(name) {
+  // points: [[temp, duty], ...]
+  function applyProfile(name, pump, points) {
     if (applying) return
-    pendingPreset = pendingPreset === name ? "" : name
-  }
-
-  function applyPending() {
-    if (pendingPreset === "" || applying) return
     applying = true
     errorText = ""
-    actionProc.requestedPreset = pendingPreset
-    actionProc.command = [helperPath, "preset", pendingPreset]
+    var cmd = [helperPath, "apply", name, String(pump)]
+    for (var i = 0; i < points.length; i++)
+      cmd.push(String(Math.round(points[i][0])), String(Math.round(points[i][1])))
+    actionProc.label = name
+    actionProc.command = cmd
     actionProc.running = true
   }
 
   function initializeDevice() {
     if (applying) return
-    if (pendingPreset !== "initialize") {
-      pendingPreset = "initialize"
-      return
-    }
     applying = true
     errorText = ""
-    actionProc.requestedPreset = "initialize"
+    actionProc.label = "Initialize"
     actionProc.command = [helperPath, "initialize"]
     actionProc.running = true
   }
 
-  function presetLabel(name) {
-    if (name === "quiet") return "Quiet"
-    if (name === "balanced") return "Balanced"
-    if (name === "performance") return "Performance"
-    if (name === "full") return "Full Speed"
-    return "Initialize"
+  function setLighting(zone, effect, color, brightness, speed) {
+    var next = JSON.parse(JSON.stringify(lighting))
+    var zones = zone === "all" ? ["aio", "fans"] : [zone]
+    for (var i = 0; i < zones.length; i++)
+      next[zones[i]] = { effect: effect, color: color, brightness: brightness, speed: speed }
+    lighting = next
+    lightProc.running = false
+    lightProc.command = [helperPath, "lighting", zone, effect, color, String(brightness), String(speed)]
+    lightProc.running = true
+  }
+
+  function reloadConfig() {
+    lightProc.running = false
+    lightProc.command = [helperPath, "lighting"]
+    lightProc.running = true
+    coolingProc.running = true
+  }
+
+  function parseJson(text) {
+    try { return JSON.parse(String(text || "")) } catch (e) { return null }
   }
 
   Process {
     id: statusProc
+    property bool cached: false
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyStatus(text)
+      onStreamFinished: if (!statusProc.cached || String(text || "") !== "") root.applyStatus(text)
     }
     stderr: StdioCollector {
       waitForEnd: true
@@ -125,17 +147,20 @@ Panel {
     }
     onExited: function(exitCode) {
       root.loading = false
-      if (exitCode !== 0) root.connected = false
+      if (statusProc.cached) root.rgbdRunning = exitCode === 0
+      else if (exitCode !== 0) root.connected = false
     }
   }
 
   Process {
     id: actionProc
-    property string requestedPreset: ""
-    property string output: ""
+    property string label: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: actionProc.output = String(text || "")
+      onStreamFinished: {
+        var result = root.parseJson(text)
+        if (result && result.ok === false) root.errorText = result.error
+      }
     }
     stderr: StdioCollector {
       waitForEnd: true
@@ -144,276 +169,124 @@ Panel {
     onExited: function(exitCode) {
       root.applying = false
       if (exitCode === 0) {
-        root.lastProfile = root.presetLabel(actionProc.requestedPreset)
-        root.pendingPreset = ""
         root.errorText = ""
+        coolingProc.running = true
+        Qt.callLater(root.refresh, true)
       } else if (root.errorText === "") {
-        root.errorText = "Could not apply " + root.presetLabel(actionProc.requestedPreset)
+        root.errorText = "Could not apply " + actionProc.label
       }
     }
   }
 
-  BarIconButton {
+  Process {
+    id: coolingProc
+    command: [root.helperPath, "cooling"]
+    running: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var cfg = root.parseJson(text)
+        if (!cfg || !cfg.profile) return
+        root.profileName = cfg.profile
+        root.profilePump = cfg.pump
+        root.profileCurve = cfg.curve
+      }
+    }
+  }
+
+  Process {
+    id: lightProc
+    command: [root.helperPath, "lighting"]
+    running: true
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var cfg = root.parseJson(text)
+        if (cfg && cfg.ok === false) root.errorText = cfg.error
+        else if (cfg && cfg.aio) root.lighting = cfg
+      }
+    }
+  }
+
+  // Reads corsair-rgbd's cache only: never touches USB, so it never flashes the RGB.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: true
+    triggeredOnStart: true
+    onTriggered: root.refresh(true)
+  }
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  WidgetButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰈐"
+    labelVisible: false
+    hasVisualContent: true
+    horizontalMargin: 6
+    active: root.opened
     tooltipText: root.connected
-      ? "Corsair cooling · " + (root.waterTemp > 0 ? root.waterTemp.toFixed(1) + "°C" : "temperature unavailable")
-        + " · pump " + root.pumpRpm + " RPM"
-      : "Corsair cooling · press r or middle-click to refresh"
-    foreground: root.opened ? Color.accent : root.temperatureColor
+      ? "Coolant " + root.waterTemp.toFixed(1) + "°C · pump " + root.pumpRpm + " RPM"
+      : (root.rgbdRunning ? "Corsair cooling · connecting…" : "Corsair cooling · middle-click to read")
+    fixedWidth: root.vertical ? -1 : Math.ceil(cell.implicitWidth + button.scaledHorizontalMargin * 2)
+    fixedHeight: root.vertical ? Math.ceil(cell.implicitHeight + Style.space(8)) : -1
 
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.MiddleButton) root.refresh()
       else root.toggle()
     }
 
-    Text {
-      anchors.left: parent.horizontalCenter
-      anchors.leftMargin: Style.space(5)
-      anchors.verticalCenter: parent.verticalCenter
-      text: root.waterTemp > 0 ? Math.round(root.waterTemp) + "°" : "--"
-      textFormat: Text.PlainText
-      color: root.temperatureColor
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
+    Row {
+      id: cell
+      anchors.centerIn: parent
+      spacing: Style.space(4)
+
+      TextMetrics {
+        id: glyphMetrics
+        font.family: root.fontFamily
+        font.pixelSize: root.iconSize
+        text: "󰈐"
+      }
+
+      Item {
+        width: Math.max(1, Math.ceil(glyphMetrics.tightBoundingRect.width))
+        height: root.contentHeight
+
+        OpticalGlyph {
+          anchors.fill: parent
+          text: "󰈐"
+          fontFamily: root.fontFamily
+          fontSize: root.iconSize
+          color: root.connected ? root.warm(Color.accent) : root.dim
+          Behavior on color { ColorAnimation { duration: 240 } }
+        }
+      }
+
+      Text {
+        visible: !root.vertical
+        height: root.contentHeight
+        text: root.waterTemp > 0 ? Math.round(root.waterTemp) + "°" : "–"
+        color: root.connected ? root.warm(root.base) : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: root.valueSize
+        font.bold: true
+        verticalAlignment: Text.AlignVCenter
+        renderType: Text.NativeRendering
+        Behavior on color { ColorAnimation { duration: 240 } }
+      }
     }
   }
 
-  KeyboardPanel {
+  CoolingPanel {
     id: panel
     anchorItem: button
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: Math.min(Style.space(360), panel.availableCardWidth)
-    contentHeight: panel.fittedContentHeight(content.implicitHeight)
-
-    PanelKeyCatcher {
-      anchors.fill: parent
-      onCloseRequested: root.close()
-      onTextKey: function(key) {
-        if (key === "r") root.refresh()
-      }
-
-      Column {
-        id: content
-        anchors.fill: parent
-        spacing: Style.space(8)
-
-        PanelSectionHeader {
-          width: parent.width
-          text: "Corsair Commander CORE"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        PanelSeparator { width: parent.width }
-
-        Row {
-          width: parent.width
-          spacing: Style.space(18)
-
-          Column {
-            width: (parent.width - parent.spacing) / 2
-            spacing: Style.space(2)
-            Text {
-              text: root.waterTemp > 0 ? root.waterTemp.toFixed(1) + "°C" : "—"
-              color: root.temperatureColor
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-            }
-            Text {
-              text: "Coolant"
-              color: root.muted
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          Column {
-            width: (parent.width - parent.spacing) / 2
-            spacing: Style.space(2)
-            Text {
-              text: root.pumpRpm >= 0 ? root.pumpRpm + " RPM" : "—"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-            }
-            Text {
-              text: "AIO pump"
-              color: root.muted
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-          }
-        }
-
-        PanelSectionHeader {
-          width: parent.width
-          text: "Fans"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        Grid {
-          width: parent.width
-          columns: 3
-          rowSpacing: Style.space(5)
-          columnSpacing: Style.space(5)
-
-          Repeater {
-            model: root.fans
-            delegate: Rectangle {
-              required property var modelData
-              width: (content.width - Style.space(10)) / 3
-              height: Style.space(42)
-              radius: Style.cornerRadius
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
-              Column {
-                anchors.centerIn: parent
-                spacing: Style.space(1)
-                Text {
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  text: modelData.rpm + " RPM"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-                Text {
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  text: modelData.name
-                  color: root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-            }
-          }
-        }
-
-        PanelSeparator { width: parent.width }
-
-        PanelSectionHeader {
-          width: parent.width
-          text: "Cooling profile"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        Text {
-          width: parent.width
-          text: "Last applied: " + root.lastProfile
-          color: root.muted
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        Grid {
-          width: parent.width
-          columns: 2
-          rowSpacing: Style.space(6)
-          columnSpacing: Style.space(6)
-
-          Repeater {
-            model: ["quiet", "balanced", "performance", "full"]
-            delegate: Button {
-              required property string modelData
-              width: (content.width - Style.space(6)) / 2
-              text: root.presetLabel(modelData)
-              bordered: root.pendingPreset === modelData
-              enabled: !root.applying
-              foreground: modelData === "full" ? root.urgent : root.foreground
-              fontFamily: root.fontFamily
-              onClicked: root.requestPreset(modelData)
-            }
-          }
-        }
-
-        Rectangle {
-          width: parent.width
-          height: root.pendingPreset !== "" ? confirmColumn.implicitHeight + Style.space(14) : 0
-          visible: root.pendingPreset !== ""
-          radius: Style.cornerRadius
-          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.07)
-
-          Column {
-            id: confirmColumn
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.leftMargin: Style.space(7)
-            anchors.rightMargin: Style.space(7)
-            spacing: Style.space(5)
-
-            Text {
-              width: parent.width
-              text: root.pendingPreset === "initialize"
-                ? "Initialize controller? Lighting may flash once."
-                : "Apply " + root.presetLabel(root.pendingPreset) + " to all six fans and AIO pump?"
-              wrapMode: Text.WordWrap
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-            }
-
-            Row {
-              anchors.right: parent.right
-              spacing: Style.space(6)
-              Button {
-                text: "Cancel"
-                enabled: !root.applying
-                foreground: root.muted
-                fontFamily: root.fontFamily
-                onClicked: root.pendingPreset = ""
-              }
-              Button {
-                text: root.applying ? "Applying…" : "Confirm"
-                bordered: true
-                enabled: !root.applying
-                foreground: root.pendingPreset === "full" ? root.urgent : Color.accent
-                accent: root.pendingPreset === "full" ? root.urgent : Color.accent
-                fontFamily: root.fontFamily
-                onClicked: root.pendingPreset === "initialize"
-                  ? root.initializeDevice() : root.applyPending()
-              }
-            }
-          }
-        }
-
-        Text {
-          width: parent.width
-          visible: root.errorText !== ""
-          text: root.errorText
-          wrapMode: Text.WordWrap
-          color: root.urgent
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        Row {
-          width: parent.width
-          spacing: Style.space(6)
-          Button {
-            text: "Initialize controller"
-            enabled: !root.applying
-            foreground: root.muted
-            fontFamily: root.fontFamily
-            onClicked: root.initializeDevice()
-          }
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: "r refreshes (RGB may flash once) · Esc closes"
-            color: root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-        }
-      }
-    }
+    widget: root
   }
 
   IpcHandler {
@@ -422,12 +295,20 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
+    // overview | cooling | lighting
+    function openTab(name: string): void { panel.tab = name; root.open() }
+    function lighting(zone: string, effect: string, color: string, brightness: int, speed: int): void {
+      root.setLighting(zone, effect, color, brightness, speed)
+    }
     function status(): string {
       return JSON.stringify({
         connected: root.connected,
         coolantC: root.waterTemp,
         pumpRpm: root.pumpRpm,
         fans: root.fans,
+        profile: root.profileName,
+        lighting: root.lighting,
+        rgbd: root.rgbdRunning,
         applying: root.applying,
         error: root.errorText
       })

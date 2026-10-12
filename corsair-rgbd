@@ -1,0 +1,391 @@
+"""Keep a Commander CORE in software mode so status reads never flash its RGB.
+
+Every liquidctl request wakes the controller (software mode, LEDs off) and then
+sleeps it (hardware mode, lighting effect restarts): that switch is the flash.
+This daemon wakes it once, renders the lighting itself, keeps re-sending frames
+(the controller drops back to hardware mode after ~30 s of silence) and caches
+telemetry for the widget.  Stopping it restores hardware lighting.
+
+Lighting comes from lighting.json (written by `corsair-cooling lighting`), and
+"theme" colours follow the current Omarchy theme live.
+
+  corsair-rgbd run                                    daemon
+  corsair-rgbd lighting [ZONE EFFECT COLOR BRIGHTNESS SPEED]
+                                                      print / validate+save lighting
+  corsair-rgbd liquidctl ARGS...                      liquidctl that wakes but never sleeps
+  corsair-rgbd check                                  self-check
+
+Run with the Python interpreter that has liquidctl installed.
+"""
+
+import colorsys
+from collections import deque
+import fcntl
+import json
+import math
+import os
+import signal
+import sys
+import time
+import tomllib
+from contextlib import contextmanager
+
+from liquidctl.driver import commander_core as cc
+
+HOME = os.path.expanduser("~")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")  # owner-only, never shared /tmp
+LOCK_FILE = os.path.join(RUNTIME, "matteodevenuto-corsair-cooling.lock")
+CACHE_FILE = os.path.join(RUNTIME, "matteodevenuto-corsair-cooling.json")
+CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", HOME + "/.config"),
+                           "matteodevenuto-corsair-cooling", "lighting.json")
+THEME_FILE = HOME + "/.local/state/omarchy/current/theme/colors.toml"
+COOLING_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "cooling.json")
+DEFAULTS = {"effect": "static", "color": "theme", "brightness": 100, "speed": 5}
+ZONES = ("aio", "fans")  # LED port 0 is the pump head, the rest are fans
+EFFECTS = {"off", "static", "breathing", "wave", "spinner", "palette", "rainbow",
+           "spectrum", "temperature"}
+ANIMATED = EFFECTS - {"off", "static", "temperature"}
+FRAME = 1 / 15  # a full LED frame takes ~40 ms of USB time
+KEEPALIVE = 3   # seconds; must stay well under the ~30 s hardware-mode fallback
+PORT_SLOTS = 34  # every RGB port after the AIO is padded to 34 LEDs (OpenRGB)
+
+
+@contextmanager
+def _wake_only(self):
+    self._send_command(cc._CMD_WAKE)
+    yield
+
+
+def find_device():
+    from liquidctl import find_liquidctl_devices
+    return next(d for d in find_liquidctl_devices() if isinstance(d, cc.CommanderCore))
+
+
+def led_counts(dev):
+    r = dev._read_data(cc._MODE_LED_COUNT, cc._DATA_TYPE_LED_COUNT)
+    return [int.from_bytes(r[3 + i * 4:5 + i * 4], "little")
+            if int.from_bytes(r[1 + i * 4:3 + i * 4], "little") == 2 else 0
+            for i in range(r[0])]
+
+
+def write_leds(dev, frame):
+    payload = (len(frame) + 2).to_bytes(2, "little") + b"\0\0\x12\0" + frame
+    dev._send_command(cc._CMD_OPEN_ENDPOINT, (0x22,))
+    dev._send_command(cc._CMD_WRITE, payload[:93])
+    for i in range(93, len(payload), 93):
+        dev._send_command(cc._CMD_WRITE_MORE, payload[i:i + 93])
+    dev._send_command(cc._CMD_CLOSE_ENDPOINT)
+
+
+def parse_targets(modes, fixed, curves):
+    """Per-channel [(tempC, duty), ...] from the controller's stored speed settings.
+    A fixed duty becomes a one-point curve, so every channel is just a curve."""
+    targets, i = [], 1
+    for ch in range(modes[0]):
+        count = curves[i + 1]
+        points = [(int.from_bytes(curves[i + 2 + k * 4:i + 4 + k * 4], "little") / 10,
+                   int.from_bytes(curves[i + 4 + k * 4:i + 6 + k * 4], "little")) for k in range(count)]
+        i += 2 + 4 * count
+        if modes[1 + ch] != 2 or not points:  # 0x00 = fixed percent
+            points = [(0, int.from_bytes(fixed[1 + ch * 2:3 + ch * 2], "little"))]
+        targets.append(points)
+    return targets
+
+
+def read_targets(dev):
+    return parse_targets(dev._read_data(cc._MODE_HW_SPEED_MODE, cc._DATA_TYPE_HW_SPEED_MODE),
+                         dev._read_data(cc._MODE_HW_FIXED_PERCENT, cc._DATA_TYPE_HW_FIXED_PERCENT),
+                         dev._read_data(cc._MODE_HW_CURVE_PERCENT, cc._DATA_TYPE_HW_CURVE_PERCENT))
+
+
+def duty_at(curve, temp):
+    if temp <= curve[0][0]:
+        return curve[0][1]
+    for (t0, d0), (t1, d1) in zip(curve, curve[1:]):
+        if temp <= t1:
+            return d0 + (d1 - d0) * (temp - t0) / (t1 - t0)
+    return curve[-1][1]
+
+
+def write_speeds(dev, duties):
+    # Curves stored on the controller only run in hardware mode; in software
+    # mode the host must set duty itself (endpoint 0x18, as FanControl.CorsairLink does).
+    data = bytes([len(duties)]) + b"".join(
+        bytes((ch, 0, max(0, min(100, round(d))), 0)) for ch, d in enumerate(duties))
+    payload = (len(data) + 2).to_bytes(2, "little") + b"\0\0\x07\0" + data
+    # CorsairLink's exact sequence, on its handle 0xfc.
+    dev._send_command((0x05, 0x01, 0xfc), (0x18,))
+    dev._send_command((0x0d, 0xfc), (0x18,))
+    dev._send_command((0x06, 0xfc), payload)
+    dev._send_command((0x05, 0x01, 0xfc), (0x18,))
+
+
+def read_status(dev):
+    # get_status() minus the wake/sleep round-trip, in liquidctl --json shape.
+    rows = [{"key": "Pump speed" if i == 0 else f"Fan speed {i}", "value": s, "unit": "rpm"}
+            for i, s in enumerate(dev._get_speeds())]
+    temps = dev._get_temps()
+    if temps and temps[0] is not None:
+        rows.append({"key": "Water temperature", "value": temps[0], "unit": "°C"})
+    return rows
+
+
+def hex_rgb(value):
+    value = str(value).lstrip("#")
+    return tuple(int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def valid_zone(z):
+    try:
+        color, brightness, speed = z["color"], z["brightness"], z["speed"]
+        return (z["effect"] in EFFECTS and type(brightness) is int and 0 <= brightness <= 100
+                and type(speed) is int and 1 <= speed <= 10
+                and (color == "theme" or (len(color) == 6 and hex_rgb(color) is not None)))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def read_config():
+    """lighting.json, with any zone that fails validation (e.g. hand-edited) reset to defaults."""
+    try:
+        with open(CONFIG_FILE) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    zones = {}
+    for z in ZONES:
+        zone = raw.get(z)
+        zone = {k: zone[k] for k in DEFAULTS if k in zone} if isinstance(zone, dict) else {}
+        zones[z] = {**DEFAULTS, **zone} if valid_zone({**DEFAULTS, **zone}) else dict(DEFAULTS)
+    return zones
+
+
+def save_lighting(zone, effect, color, brightness, speed):
+    """Validate and persist; raises ValueError on bad input (this is the trust boundary)."""
+    if zone not in ZONES + ("all",) or effect not in EFFECTS:
+        raise ValueError("unknown zone or effect")
+    if color != "theme":
+        hex_rgb(color)
+        if len(color) != 6:
+            raise ValueError("color must be theme or RRGGBB")
+    brightness, speed = int(brightness), int(speed)
+    if not (0 <= brightness <= 100 and 1 <= speed <= 10):
+        raise ValueError("brightness 0-100, speed 1-10")
+    cfg = read_config()
+    for z in ZONES if zone == "all" else (zone,):
+        cfg[z] = {"effect": effect, "color": color.lower(), "brightness": brightness, "speed": speed}
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE + ".tmp", "w") as f:
+        json.dump(cfg, f)
+    os.replace(CONFIG_FILE + ".tmp", CONFIG_FILE)
+    return cfg
+
+
+def read_theme():
+    try:
+        with open(THEME_FILE, "rb") as f:
+            theme = tomllib.load(f)
+    except (OSError, ValueError):
+        theme = {}
+    palette = [hex_rgb(theme[k]) for k in ("red", "yellow", "green", "cyan", "blue", "magenta")
+               if k in theme] or [colorsys.hsv_to_rgb(h / 6, 1, 1) for h in range(6)]
+    return theme, palette
+
+
+def load_lighting():
+    theme, palette = read_theme()
+    zones = {}
+    for z, cfg in read_config().items():
+        try:
+            color = hex_rgb(theme.get("accent", "ffffff") if cfg["color"] == "theme" else cfg["color"])
+        except (ValueError, IndexError):
+            color = (1, 1, 1)
+        zones[z] = {"effect": cfg["effect"], "color": color, "palette": palette, "coolant": 0,
+                    "brightness": max(0, min(100, int(cfg["brightness"]))) / 100,
+                    "speed": max(1, min(10, int(cfg["speed"])))}
+    return zones
+
+
+def blend(a, b, t):
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+def pixel(cfg, t, i, n):
+    """Colour of LED i of n in one ring at time t (seconds)."""
+    effect, color, phase = cfg["effect"], cfg["color"], t * cfg["speed"] / 10
+    pos = i / max(n, 1)
+    if effect == "off":
+        return (0, 0, 0)
+    if effect == "temperature":  # blue at 30 °C coolant through green to red at 45 °C
+        hot = max(0, min(1, (cfg["coolant"] - 30) / 15))
+        return colorsys.hsv_to_rgb(0.66 * (1 - hot), 1, 1)
+    if effect == "wave":
+        return tuple(c * (0.55 + 0.45 * math.sin(2 * math.pi * (pos - phase))) for c in color)
+    if effect == "breathing":
+        return tuple(c * (0.5 - 0.5 * math.cos(phase * 2 * math.pi)) for c in color)
+    if effect == "spectrum":
+        return colorsys.hsv_to_rgb(phase / 4 % 1, 1, 1)
+    if effect == "rainbow":
+        return colorsys.hsv_to_rgb((pos - phase / 2) % 1, 1, 1)
+    if effect == "spinner":
+        # Ring stays lit; the head sits *between* LEDs (anti-aliased) so it glides
+        # instead of jumping, with a tail covering half the ring.
+        behind = (phase * n - i) % n  # LEDs behind the head, fractional
+        glow = max(1 - behind / (n / 2), behind - (n - 1))  # tail, and fade-in of the next LED
+        return tuple(c * (0.3 + 0.7 * max(0, glow) ** 1.5) for c in color)
+    if effect == "palette":
+        p = cfg["palette"]
+        x = (pos - phase / 2) % 1 * len(p)
+        return blend(p[int(x)], p[(int(x) + 1) % len(p)], x % 1)
+    return color  # static
+
+
+def render(zones, counts, t):
+    frame = bytearray()
+    for zone, n in enumerate(counts):
+        cfg = zones["fans" if zone else "aio"]
+        for i in range(n):
+            frame += bytes(round(c * cfg["brightness"] * 255) for c in pixel(cfg, t, i, n))
+        if zone:
+            frame += bytes(3 * (PORT_SLOTS - n))
+    return bytes(frame)
+
+
+def mtimes():
+    return tuple(os.stat(p).st_mtime if os.path.exists(p) else 0
+                 for p in (CONFIG_FILE, THEME_FILE, COOLING_FILE))
+
+
+def run():
+    # Only flag the stop: raising mid-transaction leaves a stale USB reply behind.
+    stopping = []
+    signal.signal(signal.SIGTERM, lambda *_: stopping.append(1))
+    lock = open(LOCK_FILE, "w")
+    while not stopping:
+        try:
+            dev = find_device()
+            with dev.connect():
+                try:
+                    counts, seen, cfg, last_write, last_status, coolant = None, None, None, 0, 0, 0
+                    targets = None
+                    history = deque(maxlen=120)  # 6 minutes of coolant at one sample per KEEPALIVE
+                    while not stopping:
+                        now = time.monotonic()
+                        if mtimes() != seen:
+                            seen, cfg, last_write = mtimes(), load_lighting(), 0
+                            targets, last_status = None, 0  # re-read stored speeds after an apply
+                            for z in cfg.values():
+                                z["coolant"] = coolant
+                        animated = any(z["effect"] in ANIMATED for z in cfg.values())
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        try:
+                            if now - last_status >= KEEPALIVE:
+                                # A liquidctl call or power cycle may have put it back in hardware mode.
+                                if dev._send_command((0x02, 0x03))[3] != 2:
+                                    dev._send_command(cc._CMD_WAKE)
+                                    counts, targets, last_write = None, None, 0
+                                counts = counts or led_counts(dev)
+                                targets = targets or read_targets(dev)
+                                status, last_status = read_status(dev), now
+                                coolant = next((row["value"] for row in status
+                                                if row["key"] == "Water temperature"), coolant)
+                                history.append(coolant)
+                                write_speeds(dev, [duty_at(t, coolant) for t in targets])
+                                for z in cfg.values():
+                                    z["coolant"] = coolant
+                            else:
+                                status = None
+                            if animated or now - last_write >= KEEPALIVE:
+                                write_leds(dev, render(cfg, counts, now))
+                                last_write = now
+                        finally:
+                            fcntl.flock(lock, fcntl.LOCK_UN)
+                        if status is not None:
+                            tmp = CACHE_FILE + ".tmp"
+                            with open(tmp, "w") as f:
+                                json.dump([{"description": dev.description, "status": status,
+                                            "history": list(history)}], f)
+                            os.replace(tmp, CACHE_FILE)
+                        time.sleep(max(0, now + FRAME - time.monotonic()))
+                finally:
+                    try:
+                        os.unlink(CACHE_FILE)
+                    except FileNotFoundError:
+                        pass
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    dev._send_command(cc._CMD_SLEEP)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        except (StopIteration, OSError, AssertionError, cc.ExpectationNotMet) as e:
+            print(f"corsair-rgbd: {type(e).__name__}: {e}; retrying", file=sys.stderr, flush=True)
+            for _ in range(50):
+                if not stopping:
+                    time.sleep(0.1)
+
+
+def self_check():
+    zone = {"effect": "static", "color": (1, 0.5, 0), "palette": [(1, 0, 0), (0, 0, 1)],
+            "brightness": 1, "speed": 5, "coolant": 35}
+    zones = {"aio": zone, "fans": dict(zone, color=(0, 0, 1))}
+    frame = render(zones, [29, 8, 8, 8, 8, 8, 0], 0)
+    assert len(frame) == 3 * (29 + 6 * PORT_SLOTS)
+    assert frame[:3] == bytes((255, 128, 0)) and frame[87:90] == bytes((0, 0, 255))  # per-zone colour
+    assert frame[3 * 29 + 3 * 8:3 * 29 + 3 * PORT_SLOTS] == bytes(3 * 26)  # port padding stays dark
+    for effect in EFFECTS:
+        render({z: dict(zone, effect=effect) for z in ZONES}, [29, 8], 12.3)
+    assert render({z: dict(zone, brightness=0) for z in ZONES}, [3], 0) == bytes(9)
+    cold, hot = (pixel(dict(zone, effect="temperature", coolant=c), 0, 0, 1) for c in (25, 50))
+    assert cold[2] > cold[0] and hot[0] > hot[2]
+    # Balanced as read back from a real controller: pump fixed 85 %, fans on a curve.
+    modes = bytes([7, 0] + [2] * 6)
+    fixed = bytes([7]) + b"".join(d.to_bytes(2, "little") for d in [85] + [100] * 6)
+    block = bytes([0, 6]) + b"".join(t.to_bytes(2, "little") + d.to_bytes(2, "little")
+                                     for t, d in ((260, 35), (300, 40), (340, 55), (370, 70), (400, 85), (430, 100)))
+    targets = parse_targets(modes, fixed, bytes([7, 0, 0]) + block * 6)
+    assert targets[0] == [(0, 85)] and targets[1][0] == (26.0, 35) and len(targets) == 7
+    assert [round(duty_at(t, 35.5)) for t in targets[:2]] == [85, 62]
+    curve = [(30, 40), (40, 100)]
+    assert (duty_at(curve, 20), duty_at(curve, 35), duty_at(curve, 50)) == (40, 70, 100)
+    for bad in (("pump", "static", "theme", 1, 1), ("all", "disco", "theme", 1, 1),
+                ("all", "static", "zzzzzz", 1, 1), ("all", "static", "fff", 1, 1),
+                ("all", "static", "theme", 101, 1), ("all", "static", "theme", 50, 0)):
+        try:
+            save_lighting(*bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+    global CONFIG_FILE
+    real, CONFIG_FILE = CONFIG_FILE, "/nonexistent/lighting.json"
+    try:
+        assert read_config()["aio"] == DEFAULTS  # missing file falls back to defaults
+    finally:
+        CONFIG_FILE = real
+    for bad in ({"effect": "x"}, {"brightness": "100"}, {"speed": 99}, {"color": "#zzz"}, {"color": 5}):
+        assert not valid_zone({**DEFAULTS, **bad}), bad
+    assert valid_zone(DEFAULTS) and valid_zone({**DEFAULTS, "color": "ff0080"})
+    print("ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["run"]:
+        run()
+    elif sys.argv[1:2] == ["lighting"]:
+        try:
+            cfg = save_lighting(*sys.argv[2:7]) if len(sys.argv) == 7 else read_config()
+        except (ValueError, TypeError) as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            sys.exit(2)
+        theme, palette = read_theme()
+        cfg["theme"] = {"accent": str(theme.get("accent", "#ffffff")).lstrip("#").lower(),
+                        "palette": ["%02x%02x%02x" % tuple(round(c * 255) for c in p) for p in palette]}
+        print(json.dumps(cfg))
+    elif sys.argv[1:2] == ["check"]:
+        self_check()
+    elif sys.argv[1:2] == ["liquidctl"]:
+        cc.CommanderCore._wake_device_context = _wake_only
+        from liquidctl.cli import main
+        sys.argv = ["liquidctl", *sys.argv[2:]]
+        main()
+    else:
+        sys.exit(__doc__)

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "matteodevenuto.corsair-cooling",
   "name": "Corsair Cooling",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "author": "Matteo De Venuto",
   "license": "MIT",
-  "description": "Read Corsair Commander CORE telemetry on demand and safely apply fixed cooling presets from the Omarchy bar.",
+  "description": "Corsair Commander CORE telemetry, cooling presets and flash-free lighting effects from the Omarchy bar.",
   "homepage": "https://github.com/matteodevenuto/omarchy-corsair-cooling",
   "repository": "https://github.com/matteodevenuto/omarchy-corsair-cooling",
   "kinds": [
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Corsair Cooling",
-    "description": "On-demand coolant, pump and fan telemetry with guarded Quiet, Balanced, Performance and Full Speed presets",
+    "description": "Coolant readout with a tabbed panel: telemetry, fan curve editor and flash-free RGB lighting",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

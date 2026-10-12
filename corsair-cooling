@@ -8,12 +8,44 @@ else
   LIQUIDCTL="${HOME}/.local/bin/liquidctl"
 fi
 DEVICE="Commander Core"
-RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/tmp}"
+RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"  # owner-only, never shared /tmp
 LOCK_FILE="${RUNTIME_ROOT}/matteodevenuto-corsair-cooling.lock"
+CACHE_FILE="${RUNTIME_ROOT}/matteodevenuto-corsair-cooling.json"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/matteodevenuto-corsair-cooling"
 
 if [[ ! -x "$LIQUIDCTL" ]]; then
   printf '{"ok":false,"error":"liquidctl is not installed at %s"}\n' "$LIQUIDCTL"
   exit 1
+fi
+
+action="${1:-status}"
+PYTHON="$(dirname "$(readlink -f "$LIQUIDCTL")")/python"
+RGBD="$(dirname "$(readlink -f "$0")")/corsair-rgbd"
+
+fail() {
+  printf '{"ok":false,"error":"%s"}\n' "$1"
+  exit 2
+}
+
+case "$action" in
+  daemon) exec "$PYTHON" "$RGBD" run ;;
+  # Lighting is rendered by corsair-rgbd from its config; validated there, no USB here.
+  lighting) exec "$PYTHON" "$RGBD" lighting "${@:2}" ;;
+  cooling)
+    cat "$CONFIG_DIR/cooling.json" 2>/dev/null || printf '{}\n'
+    exit 0
+    ;;
+esac
+
+# corsair-rgbd keeps the controller in software mode and refreshes this cache
+# every few seconds.  While it runs, status is free and writes must not put the
+# controller back to sleep (hardware mode), which is what flashes the RGB.
+LIQ=("$LIQUIDCTL")
+if [[ -n "$(find "$CACHE_FILE" -newermt '-15 seconds' 2>/dev/null)" ]]; then
+  [[ "$action" == status || "$action" == cached ]] && exec cat "$CACHE_FILE"
+  LIQ=("$PYTHON" "$RGBD" liquidctl)
+elif [[ "$action" == cached ]]; then
+  exit 4
 fi
 
 # Omarchy renders one bar instance per monitor.  Commander CORE speaks a
@@ -25,52 +57,41 @@ if ! /usr/bin/flock -w 8 9; then
   exit 3
 fi
 
-action="${1:-status}"
-
 case "$action" in
   status)
-    exec "$LIQUIDCTL" --match "$DEVICE" --json status
+    exec "${LIQ[@]}" --match "$DEVICE" --json status
     ;;
   initialize)
-    "$LIQUIDCTL" --match "$DEVICE" initialize >/dev/null
+    "${LIQ[@]}" --match "$DEVICE" initialize >/dev/null
     printf '{"ok":true,"profile":"Initialized"}\n'
     ;;
-  preset)
-    preset="${2:-}"
-    case "$preset" in
-      quiet)
-        pump=75
-        curve=(28 30 32 35 35 45 38 60 41 75 43 90 45 100)
-        label="Quiet"
-        ;;
-      balanced)
-        pump=85
-        curve=(26 35 30 40 34 55 37 70 40 85 43 100)
-        label="Balanced"
-        ;;
-      performance)
-        pump=100
-        curve=(25 50 30 60 34 70 37 85 40 100)
-        label="Performance"
-        ;;
-      full)
-        "$LIQUIDCTL" --match "$DEVICE" set fans speed 100 >/dev/null
-        "$LIQUIDCTL" --match "$DEVICE" set pump speed 100 >/dev/null
-        printf '{"ok":true,"profile":"Full Speed"}\n'
-        exit 0
-        ;;
-      *)
-        printf '{"ok":false,"error":"unknown preset"}\n'
-        exit 2
-        ;;
-    esac
+  apply)
+    # apply LABEL PUMP_PERCENT TEMP DUTY [TEMP DUTY]...  (fan curve on coolant temperature)
+    label="${2:-}" pump="${3:-}"
+    points=("${@:4}")
+    [[ "$label" =~ ^[A-Za-z][A-Za-z\ ]{0,19}$ ]] || fail "bad profile name"
+    [[ "$pump" =~ ^[0-9]+$ ]] && (( pump >= 50 && pump <= 100 )) || fail "pump must be 50-100%"
+    (( ${#points[@]} % 2 == 0 && ${#points[@]} >= 4 && ${#points[@]} <= 14 )) ||
+      fail "fan curve needs 2-7 points"
+    prev_t=0 prev_d=0 json=""
+    for ((i = 0; i < ${#points[@]}; i += 2)); do
+      t="${points[i]}" d="${points[i + 1]}"
+      [[ "$t" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || fail "curve points must be integers"
+      (( t >= 20 && t <= 60 && t > prev_t )) || fail "temperatures must rise within 20-60C"
+      (( d >= 20 && d <= 100 && d >= prev_d )) || fail "fan duty must rise within 20-100%"
+      prev_t=$t prev_d=$d json+="${json:+,}[$t,$d]"
+    done
+    # Never leave a curve that cannot reach full cooling.
+    (( prev_d == 100 )) || fail "the last curve point must be 100%"
 
-    "$LIQUIDCTL" --match "$DEVICE" set fans speed "${curve[@]}" >/dev/null
-    "$LIQUIDCTL" --match "$DEVICE" set pump speed "$pump" >/dev/null
+    "${LIQ[@]}" --match "$DEVICE" set fans speed "${points[@]}" >/dev/null
+    "${LIQ[@]}" --match "$DEVICE" set pump speed "$pump" >/dev/null
+    mkdir -p "$CONFIG_DIR"
+    printf '{"profile":"%s","pump":%d,"curve":[%s]}\n' "$label" "$pump" "$json" \
+      > "$CONFIG_DIR/cooling.json"
     printf '{"ok":true,"profile":"%s"}\n' "$label"
     ;;
   *)
-    printf '{"ok":false,"error":"unknown action"}\n'
-    exit 2
+    fail "unknown action"
     ;;
 esac

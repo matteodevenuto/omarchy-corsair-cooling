@@ -1,0 +1,9 @@
+[Unit]
+Description=Commander CORE software-mode lighting (stops RGB flashing)
+
+[Service]
+ExecStart=%h/.config/omarchy/plugins/matteodevenuto.corsair-cooling/corsair-cooling daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
