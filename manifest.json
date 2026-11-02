@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "matteodevenuto.corsair-cooling",
   "name": "Corsair Cooling",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "Matteo De Venuto",
   "license": "MIT",
   "description": "Corsair Commander CORE telemetry, cooling presets and flash-free lighting effects from the Omarchy bar.",

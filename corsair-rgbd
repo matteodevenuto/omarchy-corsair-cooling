@@ -47,7 +47,6 @@ EFFECTS = {"off", "static", "breathing", "wave", "spinner", "palette", "rainbow"
 ANIMATED = EFFECTS - {"off", "static", "temperature"}
 FRAME = 1 / 15  # a full LED frame takes ~40 ms of USB time
 KEEPALIVE = 3   # seconds; must stay well under the ~30 s hardware-mode fallback
-PORT_SLOTS = 34  # every RGB port after the AIO is padded to 34 LEDs (OpenRGB)
 
 
 @contextmanager
@@ -248,8 +247,6 @@ def render(zones, counts, t):
         cfg = zones["fans" if zone else "aio"]
         for i in range(n):
             frame += bytes(round(c * cfg["brightness"] * 255) for c in pixel(cfg, t, i, n))
-        if zone:
-            frame += bytes(3 * (PORT_SLOTS - n))
     return bytes(frame)
 
 
@@ -329,9 +326,10 @@ def self_check():
             "brightness": 1, "speed": 5, "coolant": 35}
     zones = {"aio": zone, "fans": dict(zone, color=(0, 0, 1))}
     frame = render(zones, [29, 8, 8, 8, 8, 8, 0], 0)
-    assert len(frame) == 3 * (29 + 6 * PORT_SLOTS)
+    # LEDs are packed back to back at the counts the controller reports (no per-port padding).
+    assert len(frame) == 3 * (29 + 5 * 8)
     assert frame[:3] == bytes((255, 128, 0)) and frame[87:90] == bytes((0, 0, 255))  # per-zone colour
-    assert frame[3 * 29 + 3 * 8:3 * 29 + 3 * PORT_SLOTS] == bytes(3 * 26)  # port padding stays dark
+    assert frame[-3:] == bytes((0, 0, 255))  # last fan lit too
     for effect in EFFECTS:
         render({z: dict(zone, effect=effect) for z in ZONES}, [29, 8], 12.3)
     assert render({z: dict(zone, brightness=0) for z in ZONES}, [3], 0) == bytes(9)
